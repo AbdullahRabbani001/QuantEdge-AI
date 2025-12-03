@@ -18,20 +18,20 @@ export default function Markets() {
   return (
     <div className="flex min-h-screen bg-background font-sans">
       <Sidebar />
-      
+
       <main className="flex-1 pt-16 md:pt-0 md:ml-64 p-4 md:p-8">
         <header className="mb-6 md:mb-8">
           <div className="mb-4">
             <h1 className="text-2xl md:text-3xl font-bold text-foreground tracking-tight">Markets</h1>
             <p className="text-sm md:text-base text-muted-foreground">Real-time cryptocurrency market data</p>
           </div>
-          
+
           <div className="flex items-center gap-2 md:gap-4">
             <div className="relative flex-1 md:w-64">
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-              <Input 
-                placeholder="Search assets..." 
-                className="pl-10 bg-card/50 border-border" 
+              <Input
+                placeholder="Search assets..."
+                className="pl-10 bg-card/50 border-border"
               />
             </div>
             <Button size="icon" variant="outline" className="bg-card/50 border-border shrink-0">
@@ -43,7 +43,7 @@ export default function Markets() {
         <div className="rounded-xl border border-border bg-card/50 overflow-hidden backdrop-blur-sm overflow-x-auto">
           {isLoading ? (
             <div className="p-6 space-y-4">
-              {[1,2,3,4,5,6,7,8].map(i => <Skeleton key={i} className="h-16 w-full" />)}
+              {[1, 2, 3, 4, 5, 6, 7, 8].map(i => <Skeleton key={i} className="h-16 w-full" />)}
             </div>
           ) : (
             <table className="w-full text-left text-sm">

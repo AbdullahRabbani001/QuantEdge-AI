@@ -14,7 +14,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 export default function Dashboard() {
   const { data: markets, isLoading: marketsLoading } = useQuery({
     queryKey: ['markets'],
-    queryFn: () => fetchMarkets(10),
+    queryFn: () => fetchMarkets(50),
     refetchInterval: 60000, // Refresh every minute
   });
 

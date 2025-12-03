@@ -57,13 +57,40 @@ export function simpleMovingAverage(values: number[], period: number): number[] 
 export function exponentialMovingAverage(values: number[], period: number): number[] {
   const ema: number[] = [];
   const multiplier = 2 / (period + 1);
-  
+
+  // Initialize with SMA
+  if (values.length < period) return values; // Not enough data
+
+  let sum = 0;
+  for (let i = 0; i < period; i++) {
+    sum += values[i];
+  }
+  const initialSMA = sum / period;
+
+  // Fill first period-1 with nulls or partial EMAs (standard is usually to start output at index period-1)
+  // But to keep array length same, we can fill with NaNs or just start calculating
+  // For this implementation, we'll replicate the previous behavior of returning an array of same length
+  // But we'll use SMA for the first valid point
+
   for (let i = 0; i < values.length; i++) {
-    if (i === 0) {
-      ema.push(values[0]);
+    if (i < period - 1) {
+      ema.push(values[i]); // Fallback for initial values
+    } else if (i === period - 1) {
+      ema.push(initialSMA);
     } else {
       ema.push((values[i] - ema[i - 1]) * multiplier + ema[i - 1]);
     }
   }
   return ema;
+}
+
+export function downsideDeviation(values: number[], target: number = 0): number {
+  if (values.length === 0) return 0;
+
+  const squaredDownsideDiffs = values.map(val => {
+    const diff = Math.min(0, val - target);
+    return diff * diff;
+  });
+
+  return Math.sqrt(mean(squaredDownsideDiffs));
 }

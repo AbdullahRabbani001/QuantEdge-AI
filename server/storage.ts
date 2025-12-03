@@ -55,6 +55,7 @@ export interface IStorage {
   // Realized PnL Logs
   getRealizedPnlLogsByPortfolioId(portfolioId: number): Promise<RealizedPnlLog[]>;
   createRealizedPnlLog(log: InsertRealizedPnlLog): Promise<RealizedPnlLog>;
+  deleteRealizedPnlLogByTradeId(tradeId: number): Promise<void>;
 }
 
 export class DatabaseStorage implements IStorage {
@@ -152,6 +153,10 @@ export class DatabaseStorage implements IStorage {
   async createRealizedPnlLog(log: InsertRealizedPnlLog): Promise<RealizedPnlLog> {
     const [newLog] = await db.insert(realizedPnlLogs).values(log).returning();
     return newLog;
+  }
+
+  async deleteRealizedPnlLogByTradeId(tradeId: number): Promise<void> {
+    await db.delete(realizedPnlLogs).where(eq(realizedPnlLogs.tradeId, tradeId));
   }
 }
 
@@ -276,6 +281,13 @@ export class MockStorage implements IStorage {
     const newLog: RealizedPnlLog = { ...log, createdAt: new Date() };
     this.realizedPnlLogs.push(newLog);
     return newLog;
+  }
+
+  async deleteRealizedPnlLogByTradeId(tradeId: number): Promise<void> {
+    const index = this.realizedPnlLogs.findIndex(log => log.tradeId === tradeId);
+    if (index !== -1) {
+      this.realizedPnlLogs.splice(index, 1);
+    }
   }
 }
 

@@ -5,15 +5,15 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { formatDistanceToNow } from "date-fns";
 
 const getSignalColor = (signal: string) => {
-  if (signal === 'Bullish') return 'text-green-500';
-  if (signal === 'Bearish') return 'text-red-500';
+  if (signal === 'BUY' || signal === 'Bullish') return 'text-green-500';
+  if (signal === 'SELL' || signal === 'Bearish') return 'text-red-500';
   return 'text-yellow-500';
 };
 
 export function RecentSignals() {
   const { data: signals, isLoading } = useQuery({
     queryKey: ['quant-signals'],
-    queryFn: () => fetchQuantSignals(5),
+    queryFn: () => fetchQuantSignals(50),
     refetchInterval: 300000, // Refresh every 5 minutes
   });
 
@@ -45,12 +45,19 @@ export function RecentSignals() {
                   <div>
                     <div className="flex items-center gap-2">
                       <span className="font-bold text-foreground">{signal.symbol}</span>
-                      <span className={`text-xs font-medium ${color} uppercase`}>{signal.signal}</span>
+                      <span className={`text-xs font-medium ${color} uppercase`}>
+                        {signal.signal === 'BUY' ? 'BUY' : 
+                         signal.signal === 'SELL' ? 'SELL' : 
+                         signal.signal === 'HOLD' ? 'HOLD' :
+                         signal.signal === 'Bullish' ? 'BULLISH' :
+                         signal.signal === 'Bearish' ? 'BEARISH' :
+                         'NEUTRAL'}
+                      </span>
                     </div>
                     <div className="text-xs text-muted-foreground">Score: {signal.score}/100</div>
                   </div>
                 </div>
-                
+
                 <div className="text-right">
                   <div className="font-mono text-sm font-medium text-foreground">{signal.confidence}%</div>
                   <div className="text-xs text-muted-foreground">

@@ -1,10 +1,11 @@
 import { Sidebar } from "@/components/layout/Sidebar";
-import { BrainCircuit, ArrowUpDown } from "lucide-react";
+import { BrainCircuit, ArrowUpDown, RefreshCw } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { useState, useMemo } from "react";
-import { useQuery, useQueries } from "@tanstack/react-query";
-import { fetchMarkets, fetchQuantScore } from "@/lib/api";
+import { useQuery } from "@tanstack/react-query";
+import { fetchQuantTop50 } from "@/lib/api";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Button } from "@/components/ui/button";
 
 type SortField = 'symbol' | 'score' | 'signal' | 'confidence';
 type SortDirection = 'asc' | 'desc';
@@ -14,39 +15,63 @@ export default function Strategies() {
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
   const [searchQuery, setSearchQuery] = useState('');
 
-  // Fetch top 10 coins (reduced from 50 to avoid API rate limits)
-  const { data: markets, isLoading: marketsLoading } = useQuery({
-    queryKey: ['markets-quant'],
-    queryFn: () => fetchMarkets(10),
+  // Fetch top 50 coins with quant analysis
+  const { data: quantData, isLoading: marketsLoading, error, refetch } = useQuery({
+    queryKey: ['quant-top50'],
+    queryFn: () => fetchQuantTop50(50, '1d'),
     refetchInterval: 300000, // Refresh every 5 minutes
+    retry: 2, // Retry failed requests twice
   });
 
-  // Fetch quant scores for all coins using useQueries (proper React Query pattern)
-  const symbols = markets?.map((coin: any) => coin.symbol.toUpperCase()) || [];
-  
-  const quantQueries = useQueries({
-    queries: symbols.map((symbol: string) => ({
-      queryKey: ['quant-score', symbol],
-      queryFn: () => fetchQuantScore(symbol, '1d'),
-      enabled: !!symbol,
-      staleTime: 300000, // Cache for 5 minutes
-      retry: 1, // Only retry once to avoid too many failed requests
-    })),
-  });
-
-  // Combine markets with their quant scores
+  // Process quant data from unified endpoint
   const coinsWithScores = useMemo(() => {
-    if (!markets) return [];
+    if (!quantData) {
+      console.log('[Strategies] No quant data available');
+      return [];
+    }
     
-    return markets.map((coin: any, index: number) => {
-      const quantQuery = quantQueries[index];
+    if (!Array.isArray(quantData)) {
+      console.error('[Strategies] Quant data is not an array:', quantData);
+      return [];
+    }
+
+    if (quantData.length === 0) {
+      console.warn('[Strategies] Quant data array is empty');
+      return [];
+    }
+    
+    console.log(`[Strategies] Processing ${quantData.length} coins`);
+    
+    return quantData.map((item: any) => {
+      // Determine signal directly from composite score to ensure consistency
+      const compositeScore = item.scores?.compositeScore ?? item.score ?? 50;
+      const signal = compositeScore >= 65 ? 'Bullish' : 
+                     compositeScore <= 35 ? 'Bearish' : 'Neutral';
+      
       return {
-        ...coin,
-        quantScore: quantQuery.data,
-        isLoadingScore: quantQuery.isLoading,
+        id: item.symbol.toLowerCase(),
+        symbol: item.symbol,
+        name: item.symbol, // Will be enhanced with market data if needed
+        current_price: item.currentPrice || 0,
+        price_change_percentage_24h: item.metrics?.momentum?.roc || 0,
+        quantScore: {
+          score: compositeScore,
+          signal: signal,
+          confidence: item.confidence,
+          factors: {
+            trend: item.scores.trend,
+            momentum: item.scores.momentum,
+            volatility: item.scores.volatility,
+            volume: item.scores.volume,
+            risk: item.scores.risk,
+            sentiment: item.scores.sentiment
+          }
+        },
+        isLoadingScore: false,
+        marketRegime: item.marketRegime
       };
     });
-  }, [markets, quantQueries]);
+  }, [quantData]);
 
   // Filter and sort
   const filteredAndSortedCoins = useMemo(() => {
@@ -117,7 +142,7 @@ export default function Strategies() {
               <BrainCircuit className="h-6 w-6 md:h-8 md:w-8 text-primary" />
               Quant Lab
             </h1>
-            <p className="text-sm md:text-base text-muted-foreground">Top 10 crypto assets with real-time quant analysis</p>
+            <p className="text-sm md:text-base text-muted-foreground">Top 50 crypto assets with real-time quant analysis</p>
           </div>
           <div className="w-full md:w-64">
             <Input
@@ -257,10 +282,32 @@ export default function Strategies() {
           )}
         </div>
 
-        {filteredAndSortedCoins.length === 0 && !marketsLoading && (
+        {error && (
           <div className="rounded-xl border border-border bg-card/50 p-12 text-center mt-8">
             <BrainCircuit className="h-16 w-16 text-muted-foreground mx-auto mb-4" />
-            <p className="text-muted-foreground">No coins found matching "{searchQuery}"</p>
+            <p className="text-red-500 mb-2 font-semibold">Error loading quant data</p>
+            <p className="text-muted-foreground text-sm mb-4">{error instanceof Error ? error.message : 'Unknown error'}</p>
+            <Button onClick={() => refetch()} variant="outline" size="sm">
+              <RefreshCw className="h-4 w-4 mr-2" />
+              Retry
+            </Button>
+          </div>
+        )}
+        {filteredAndSortedCoins.length === 0 && !marketsLoading && !error && (
+          <div className="rounded-xl border border-border bg-card/50 p-12 text-center mt-8">
+            <BrainCircuit className="h-16 w-16 text-muted-foreground mx-auto mb-4" />
+            <p className="text-muted-foreground mb-2">
+              {searchQuery ? `No coins found matching "${searchQuery}"` : 'No quant data available yet.'}
+            </p>
+            <p className="text-muted-foreground text-sm mb-4">
+              {searchQuery ? 'Try a different search term.' : 'The analysis may still be processing. This can take a minute for 50 coins.'}
+            </p>
+            {!searchQuery && (
+              <Button onClick={() => refetch()} variant="outline" size="sm">
+                <RefreshCw className="h-4 w-4 mr-2" />
+                Refresh Data
+              </Button>
+            )}
           </div>
         )}
       </main>

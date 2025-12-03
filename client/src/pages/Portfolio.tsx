@@ -31,6 +31,7 @@ export default function Portfolio() {
   const [sellLivePrice, setSellLivePrice] = useState<number | null>(null);
   const [isSellLoadingPrice, setIsSellLoadingPrice] = useState(false);
   const [sellPriceError, setSellPriceError] = useState<string | null>(null);
+  const [deletingTradeId, setDeletingTradeId] = useState<number | null>(null);
 
   const { data: portfolio, isLoading } = useQuery({
     queryKey: ['portfolio'],
@@ -52,8 +53,15 @@ export default function Portfolio() {
 
   const deleteTradeMutation = useMutation({
     mutationFn: deleteTrade,
+    onMutate: (tradeId: number) => {
+      setDeletingTradeId(tradeId);
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['portfolio'] });
+      setDeletingTradeId(null);
+    },
+    onError: () => {
+      setDeletingTradeId(null);
     },
   });
 
@@ -571,15 +579,23 @@ export default function Portfolio() {
                     </td>
                     <td className="px-6 py-4 text-right font-mono">{trade.quantity}</td>
                     <td className="px-6 py-4 text-right font-mono">${trade.buyPrice}</td>
-                    <td className="px-6 py-4 text-right">
+                    <td className="px-6 py-4 text-right relative z-10">
                       <Button
+                        type="button"
                         size="sm"
                         variant="ghost"
-                        className="text-destructive hover:text-destructive/80"
-                        onClick={() => deleteTradeMutation.mutate(trade.id)}
+                        className="text-destructive hover:text-destructive/80 hover:bg-destructive/10 cursor-pointer active:bg-destructive/20 relative z-20"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          if (deletingTradeId === null) {
+                            deleteTradeMutation.mutate(trade.id);
+                          }
+                        }}
+                        disabled={deletingTradeId !== null}
                         data-testid={`button-delete-${trade.id}`}
                       >
-                        Delete
+                        {deletingTradeId === trade.id ? 'Deleting...' : 'Delete'}
                       </Button>
                     </td>
                   </tr>

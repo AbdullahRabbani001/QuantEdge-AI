@@ -19,23 +19,40 @@ export interface CoinData {
   max_supply: number;
 }
 
+// Simple in-memory cache
+const cache: Record<string, { data: any; timestamp: number }> = {};
+const CACHE_DURATION = 60 * 1000; // 1 minute
+
 /**
  * Fetch top coins from CoinGecko
  */
 export async function fetchTopCoins(limit: number = 50): Promise<CoinData[]> {
+  const cacheKey = `topCoins_${limit}`;
+  const now = Date.now();
+
+  if (cache[cacheKey] && now - cache[cacheKey].timestamp < CACHE_DURATION) {
+    return cache[cacheKey].data;
+  }
+
   try {
     const response = await fetch(
       `${COINGECKO_API}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=${limit}&page=1&sparkline=false`
     );
-    
+
     if (!response.ok) {
+      if (response.status === 429) {
+        console.warn('CoinGecko rate limit hit, returning cached data if available');
+        return cache[cacheKey]?.data || [];
+      }
       throw new Error(`CoinGecko API error: ${response.statusText}`);
     }
-    
-    return await response.json();
+
+    const data = await response.json();
+    cache[cacheKey] = { data, timestamp: now };
+    return data;
   } catch (error) {
     console.error('Error fetching top coins:', error);
-    return [];
+    return cache[cacheKey]?.data || [];
   }
 }
 
@@ -43,19 +60,37 @@ export async function fetchTopCoins(limit: number = 50): Promise<CoinData[]> {
  * Fetch single coin data from CoinGecko
  */
 export async function fetchCoinData(coinId: string): Promise<any> {
+  const cacheKey = `coin_${coinId}`;
+  const now = Date.now();
+
+  if (cache[cacheKey] && now - cache[cacheKey].timestamp < CACHE_DURATION) {
+    return cache[cacheKey].data;
+  }
+
   try {
     const response = await fetch(
       `${COINGECKO_API}/coins/${coinId}?localization=false&tickers=false&community_data=false&developer_data=false`
     );
-    
+
     if (!response.ok) {
-      throw new Error(`CoinGecko API error: ${response.statusText}`);
+      if (response.status === 429) {
+        console.warn(`CoinGecko rate limit hit for ${coinId}, returning cached data if available`);
+        return cache[cacheKey]?.data || null;
+      }
+      if (response.status === 404) {
+        console.warn(`CoinGecko: Coin ID "${coinId}" not found`);
+        return null;
+      }
+      console.error(`CoinGecko API error for ${coinId}: ${response.status} ${response.statusText}`);
+      return cache[cacheKey]?.data || null;
     }
-    
-    return await response.json();
+
+    const data = await response.json();
+    cache[cacheKey] = { data, timestamp: now };
+    return data;
   } catch (error) {
     console.error(`Error fetching coin data for ${coinId}:`, error);
-    return null;
+    return cache[cacheKey]?.data || null;
   }
 }
 
@@ -85,6 +120,33 @@ export function symbolToCoinGeckoId(symbol: string): string {
 }
 
 /**
+ * List of stablecoins that don't trade on Binance (or trade against themselves)
+ * These should skip Binance and go directly to CoinGecko
+ */
+const STABLECOINS = new Set([
+  'USDT', 'USDC', 'BUSD', 'DAI', 'TUSD', 'USDP', 'USDD', 'GUSD',
+  'USDK', 'HUSD', 'PAX', 'CUSD', 'USDJ', 'USDE', 'USD1', 'USDT0'
+]);
+
+/**
+ * Check if a symbol is a stablecoin
+ */
+export function isStablecoin(symbol: string): boolean {
+  const symbolUpper = symbol.toUpperCase();
+  // Check exact match
+  if (STABLECOINS.has(symbolUpper)) {
+    return true;
+  }
+  // Check if symbol starts with pattern (e.g., USDT0 starts with USDT)
+  for (const stablecoin of STABLECOINS) {
+    if (symbolUpper.startsWith(stablecoin) || symbolUpper === stablecoin) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Fetch OHLC (klines) data from Binance
  */
 export interface BinanceKline {
@@ -104,21 +166,21 @@ export async function fetchBinanceKlines(
 ): Promise<BinanceKline[]> {
   try {
     // Ensure symbol is in USDT pair format
-    const pair = symbol.toUpperCase().endsWith('USDT') 
-      ? symbol.toUpperCase() 
+    const pair = symbol.toUpperCase().endsWith('USDT')
+      ? symbol.toUpperCase()
       : `${symbol.toUpperCase()}USDT`;
-    
+
     const response = await fetch(
       `${BINANCE_API}/klines?symbol=${pair}&interval=${interval}&limit=${limit}`
     );
-    
+
     if (!response.ok) {
       // Silently fail for unsupported pairs (Bad Request, Not Found)
       return [];
     }
-    
+
     const data = await response.json();
-    
+
     return data.map((kline: any[]) => ({
       openTime: kline[0],
       open: kline[1],
@@ -167,32 +229,46 @@ export function extractPriceVolume(klines: BinanceKline[]): {
 
 /**
  * Fetch historical price data from CoinGecko (alternative to Binance)
+ * Note: CoinGecko only supports daily intervals, so all intervals are converted to daily
  */
 export async function fetchCoinGeckoHistory(
   coinId: string,
   days: number = 100
 ): Promise<BinanceKline[]> {
   try {
-    const response = await fetch(
-      `${COINGECKO_API}/coins/${coinId}/market_chart?vs_currency=usd&days=${days}&interval=daily`
-    );
+    // CoinGecko market_chart API has limits: max 365 days for daily, max 90 days for hourly
+    // We'll use daily for simplicity and cap at 365 days
+    const cappedDays = Math.min(days, 365);
     
+    const response = await fetch(
+      `${COINGECKO_API}/coins/${coinId}/market_chart?vs_currency=usd&days=${cappedDays}&interval=daily`
+    );
+
     if (!response.ok) {
-      // Silently fail for unsupported coin IDs
+      if (response.status === 404) {
+        console.warn(`CoinGecko: Coin ID "${coinId}" not found`);
+      } else {
+        console.warn(`CoinGecko API error for ${coinId}: ${response.status} ${response.statusText}`);
+      }
       return [];
     }
-    
+
     const data = await response.json();
-    
+
     // Convert CoinGecko format to our kline format
     // CoinGecko returns [timestamp, price] arrays
     const prices = data.prices || [];
     const volumes = data.total_volumes || [];
-    
+
+    if (prices.length === 0) {
+      console.warn(`CoinGecko: No price data for ${coinId}`);
+      return [];
+    }
+
     return prices.map((pricePoint: [number, number], index: number) => {
       const price = pricePoint[1];
       const volume = volumes[index] ? volumes[index][1] : 0;
-      
+
       return {
         openTime: pricePoint[0],
         open: price.toString(),
@@ -204,43 +280,94 @@ export async function fetchCoinGeckoHistory(
       };
     });
   } catch (error) {
-    // Silently fail on network errors
+    console.error(`Error fetching CoinGecko history for ${coinId}:`, error);
     return [];
   }
 }
 
 /**
  * Fetch OHLC data - tries Binance first, falls back to CoinGecko
+ * For stablecoins, skips Binance and goes directly to CoinGecko
  */
 export async function fetchOHLCData(
   symbol: string,
   interval: '1h' | '4h' | '1d' | '1w' = '1d',
   limit: number = 100
 ): Promise<BinanceKline[]> {
-  // Try Binance first
-  const binanceData = await fetchBinanceKlines(symbol, interval, limit);
+  const symbolUpper = symbol.toUpperCase();
   
+  // Skip Binance for stablecoins (they don't trade against themselves)
+  if (isStablecoin(symbolUpper)) {
+    const coinId = symbolToCoinGeckoId(symbolUpper);
+    // Convert limit to days (approximate: 1 day = 1 data point for daily interval)
+    // For hourly intervals, we still use daily from CoinGecko (it only supports daily)
+    const days = Math.min(Math.ceil(limit / 1), 365); // Cap at 365 days
+    const data = await fetchCoinGeckoHistory(coinId, days);
+    
+    if (data.length === 0) {
+      console.warn(`No OHLC data found for stablecoin ${symbolUpper} (CoinGecko ID: ${coinId})`);
+    }
+    
+    return data;
+  }
+
+  // Try Binance first for non-stablecoins
+  const binanceData = await fetchBinanceKlines(symbol, interval, limit);
+
   if (binanceData.length > 0) {
     return binanceData;
   }
-  
+
   // Fallback to CoinGecko
-  const coinId = symbolToCoinGeckoId(symbol);
-  return await fetchCoinGeckoHistory(coinId, limit);
+  const coinId = symbolToCoinGeckoId(symbolUpper);
+  // Convert limit to days (approximate conversion)
+  const days = Math.min(Math.ceil(limit / 1), 365);
+  const data = await fetchCoinGeckoHistory(coinId, days);
+  
+  if (data.length === 0) {
+    console.warn(`No OHLC data found for ${symbolUpper} (CoinGecko ID: ${coinId})`);
+  }
+  
+  return data;
 }
 
 /**
  * Fetch current price from Binance with CoinGecko fallback
+ * For stablecoins, skips Binance and goes directly to CoinGecko
  */
 export async function fetchCurrentPrice(symbol: string): Promise<number | null> {
-  // Try Binance first
+  const symbolUpper = symbol.toUpperCase();
+  
+  // Skip Binance for stablecoins (they don't trade against themselves)
+  if (isStablecoin(symbolUpper)) {
+    try {
+      const coinId = symbolToCoinGeckoId(symbolUpper);
+      const response = await fetch(
+        `${COINGECKO_API}/simple/price?ids=${coinId}&vs_currencies=usd`
+      );
+
+      if (response.ok) {
+        const data = await response.json();
+        if (data[coinId]?.usd) {
+          return data[coinId].usd;
+        }
+      } else {
+        console.warn(`CoinGecko price fetch failed for ${symbolUpper} (ID: ${coinId}): ${response.status}`);
+      }
+    } catch (error) {
+      console.error(`Error fetching current price for stablecoin ${symbolUpper}:`, error);
+    }
+    return null;
+  }
+
+  // Try Binance first for non-stablecoins
   try {
-    const pair = symbol.toUpperCase().endsWith('USDT') 
-      ? symbol.toUpperCase() 
-      : `${symbol.toUpperCase()}USDT`;
-    
+    const pair = symbolUpper.endsWith('USDT')
+      ? symbolUpper
+      : `${symbolUpper}USDT`;
+
     const response = await fetch(`${BINANCE_API}/ticker/price?symbol=${pair}`);
-    
+
     if (response.ok) {
       const data = await response.json();
       return parseFloat(data.price);
@@ -248,14 +375,14 @@ export async function fetchCurrentPrice(symbol: string): Promise<number | null> 
   } catch (error) {
     // Silently fall through to CoinGecko
   }
-  
+
   // Fallback to CoinGecko
   try {
-    const coinId = symbolToCoinGeckoId(symbol);
+    const coinId = symbolToCoinGeckoId(symbolUpper);
     const response = await fetch(
       `${COINGECKO_API}/simple/price?ids=${coinId}&vs_currencies=usd`
     );
-    
+
     if (response.ok) {
       const data = await response.json();
       if (data[coinId]?.usd) {
@@ -263,8 +390,8 @@ export async function fetchCurrentPrice(symbol: string): Promise<number | null> 
       }
     }
   } catch (error) {
-    console.error(`Error fetching current price for ${symbol}:`, error);
+    console.error(`Error fetching current price for ${symbolUpper}:`, error);
   }
-  
+
   return null;
 }

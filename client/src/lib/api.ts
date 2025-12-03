@@ -21,8 +21,20 @@ export async function fetchKlines(symbol: string, interval: string = '1d', limit
 }
 
 export async function fetchQuantScore(symbol: string, interval: string = '1d') {
-  const response = await fetch(`${API_BASE}/quant/score/${symbol}?interval=${interval}`);
+  const response = await fetch(`${API_BASE}/quant/${symbol}?interval=${interval}`);
   if (!response.ok) throw new Error('Failed to fetch quant score');
+  return response.json();
+}
+
+export async function fetchQuantTop50(limit: number = 50, interval: string = '1d') {
+  const response = await fetch(`${API_BASE}/quant/top50?limit=${limit}&interval=${interval}`);
+  if (!response.ok) throw new Error('Failed to fetch top 50 quant scores');
+  return response.json();
+}
+
+export async function fetchQuantSignal(symbol: string, interval: string = '1d') {
+  const response = await fetch(`${API_BASE}/quant/signal/${symbol}?interval=${interval}`);
+  if (!response.ok) throw new Error('Failed to fetch quant signal');
   return response.json();
 }
 

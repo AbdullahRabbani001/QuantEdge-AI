@@ -11,8 +11,8 @@ import {
   fetchCurrentPrice,
   symbolToCoinGeckoId
 } from "./lib/marketData";
-import { calculateQuantScore, calculateMarketRegime } from "./lib/quant/scoring";
-import { exponentialMovingAverage } from "./lib/quant/statistics";
+import { runQuantEngine, type QuantEngineOutput } from "./lib/quant/engine";
+import { quantCache } from "./lib/cache";
 
 export async function registerRoutes(app: Express): Promise<Server> {
   console.log('🚀 Running in local development mode (no authentication)');
@@ -60,7 +60,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
    */
   app.get("/api/markets", async (req, res) => {
     try {
-      const limit = parseInt(req.query.limit as string) || 50;
+      const limit = parseInt(req.query.limit as string) || 100;
       const coins = await fetchTopCoins(limit);
       res.json(coins);
     } catch (error) {
@@ -136,51 +136,132 @@ export async function registerRoutes(app: Express): Promise<Server> {
   // ============================================
 
   /**
-   * GET /api/quant/score/:symbol
-   * Calculate multi-factor quant score
+   * GET /api/quant/top50
+   * Get quant analysis for top 50 coins
    */
-  app.get("/api/quant/score/:symbol", async (req, res) => {
+  app.get("/api/quant/top50", async (req, res) => {
     try {
-      const { symbol } = req.params;
-      const interval = (req.query.interval as '1h' | '4h' | '1d' | '1w') || '1d';
+      const interval = (req.query.interval as '1h' | '1d') || '1d';
+      const limit = parseInt(req.query.limit as string) || 50;
 
-      // Fetch market data
-      const klines = await fetchOHLCData(symbol, interval, 200);
+      console.log(`[quant/top50] Fetching top ${limit} coins with interval ${interval}`);
 
-      if (klines.length === 0) {
-        return res.status(404).json({ error: "No data available for symbol" });
+      // Fetch top coins
+      const coins = await fetchTopCoins(limit);
+      
+      if (!coins || coins.length === 0) {
+        console.error("[quant/top50] No coins fetched from CoinGecko");
+        return res.status(500).json({ error: "Failed to fetch market data" });
       }
 
-      const ohlc = klinesToOHLC(klines);
-      const { closes, volumes, highs, lows } = extractPriceVolume(klines);
+      console.log(`[quant/top50] Fetched ${coins.length} coins, processing quant analysis...`);
+      
+      // Process each coin in parallel (with rate limiting consideration)
+      const results = await Promise.allSettled(
+        coins.map(async (coin: any) => {
+          const symbol = coin.symbol.toUpperCase();
+          const cacheKey = `quant_${symbol}_${interval}`;
+          
+          // Check cache first, but recalculate if it's a stablecoin to ensure correct score
+          const cached = quantCache.get<QuantEngineOutput>(cacheKey);
+          const isStablecoinCheck = symbol.includes('USD') && coin.current_price > 0.85 && coin.current_price < 1.15;
+          
+          // Don't use cache for stablecoins - always recalculate to ensure neutral score
+          if (cached && !isStablecoinCheck) {
+            console.log(`[quant/top50] Using cached data for ${symbol}`);
+            return { ...cached, symbol, currentPrice: coin.current_price };
+          }
+          
+          if (cached && isStablecoinCheck) {
+            console.log(`[quant/top50] Stablecoin detected (${symbol}), recalculating to ensure neutral score`);
+          }
 
-      // Calculate quant score (sentiment defaults to 50)
-      const score = calculateQuantScore(symbol.toUpperCase(), closes, ohlc, volumes, 50);
+          try {
+            // Fetch OHLC data
+            const klines = await fetchOHLCData(symbol, interval, 200);
+            if (klines.length === 0) {
+              console.warn(`[quant/top50] No OHLC data for ${symbol}`);
+              return null;
+            }
 
-      // Save to database
-      await storage.createQuantSignal({
-        symbol: symbol.toUpperCase(),
-        score: score.score,
-        signal: score.signal,
-        confidence: score.confidence,
-        factors: score.factors as any,
-        explanation: score.explanation,
-      });
+            const ohlc = klinesToOHLC(klines);
+            const { closes, volumes } = extractPriceVolume(klines);
 
-      res.json(score);
+            // Run quant engine
+            const result = await runQuantEngine({
+              symbol,
+              prices: closes,
+              ohlc,
+              volumes,
+              interval,
+              sentimentScore: 50 // Default, will be updated with sentiment API
+            });
+
+            // Cache for 1 minute
+            quantCache.set(cacheKey, result, 60 * 1000);
+
+            // Ensure signal is correctly determined from composite score
+            const top50Signal = result.scores.compositeScore >= 65 ? 'BUY' : 
+                               result.scores.compositeScore <= 35 ? 'SELL' : 'HOLD';
+            
+            // Save to database
+            await storage.createQuantSignal({
+              symbol,
+              score: result.scores.compositeScore,
+              signal: top50Signal === 'BUY' ? 'Bullish' : top50Signal === 'SELL' ? 'Bearish' : 'Neutral',
+              confidence: result.confidence,
+              factors: {
+                trend: result.scores.trend,
+                momentum: result.scores.momentum,
+                volatility: result.scores.volatility,
+                volume: result.scores.volume,
+                risk: result.scores.risk,
+                sentiment: result.scores.sentiment
+              } as any,
+              explanation: `Composite: ${result.scores.compositeScore}, Regime: ${result.marketRegime}`,
+            });
+
+            // Ensure signal is correctly determined from composite score
+            const top50FinalSignal = result.scores.compositeScore >= 65 ? 'BUY' : 
+                                    result.scores.compositeScore <= 35 ? 'SELL' : 'HOLD';
+            
+            console.log(`[quant/top50] Successfully processed ${symbol} - Score: ${result.scores.compositeScore}, Signal: ${top50FinalSignal}`);
+            return { ...result, symbol, currentPrice: coin.current_price, signal: top50FinalSignal };
+          } catch (error) {
+            console.error(`[quant/top50] Error processing ${symbol}:`, error);
+            return null;
+          }
+        })
+      );
+
+      // Filter out failed/null results
+      const validResults = results
+        .filter((r): r is PromiseFulfilledResult<any> => r.status === 'fulfilled' && r.value !== null)
+        .map(r => r.value);
+
+      console.log(`[quant/top50] Returning ${validResults.length} valid results out of ${coins.length} coins`);
+
+      // Return empty array if no results - frontend will handle the empty state
+      // This is better than returning a 500 error, as it allows the UI to show a helpful message
+      if (validResults.length === 0) {
+        console.error("[quant/top50] No valid results - all coins failed to process. This might be due to API rate limits or network issues.");
+      }
+
+      res.json(validResults);
     } catch (error) {
-      console.error(`Error in /api/quant/score/${req.params.symbol}:`, error);
-      res.status(500).json({ error: "Failed to calculate quant score" });
+      console.error("[quant/top50] Error in /api/quant/top50:", error);
+      res.status(500).json({ error: "Failed to calculate quant scores" });
     }
   });
 
   /**
    * GET /api/quant/signals
    * Fetch recent quant signals from database
+   * NOTE: This must be defined BEFORE /api/quant/:symbol to avoid route conflicts
    */
   app.get("/api/quant/signals", async (req, res) => {
     try {
-      const limit = parseInt(req.query.limit as string) || 10;
+      const limit = parseInt(req.query.limit as string) || 50;
       const signals = await storage.getRecentQuantSignals(limit);
       res.json(signals);
     } catch (error) {
@@ -190,11 +271,157 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   /**
+   * GET /api/quant/:symbol
+   * Get detailed quant analysis for a single symbol
+   */
+  app.get("/api/quant/:symbol", async (req, res) => {
+    try {
+      const { symbol } = req.params;
+      const interval = (req.query.interval as '1h' | '1d') || '1d';
+      const cacheKey = `quant_${symbol.toUpperCase()}_${interval}`;
+
+      // Check cache
+      const cached = quantCache.get<QuantEngineOutput>(cacheKey);
+      if (cached) {
+        return res.json(cached);
+      }
+
+      // Fetch market data
+      const klines = await fetchOHLCData(symbol, interval, 200);
+
+      if (klines.length === 0) {
+        return res.status(404).json({ error: "No data available for symbol" });
+      }
+
+      const ohlc = klinesToOHLC(klines);
+      const { closes, volumes } = extractPriceVolume(klines);
+
+      // Run quant engine
+      const result = await runQuantEngine({
+        symbol: symbol.toUpperCase(),
+        prices: closes,
+        ohlc,
+        volumes,
+        interval,
+        sentimentScore: 50 // Default
+      });
+
+      // Cache for 1 minute
+      quantCache.set(cacheKey, result, 60 * 1000);
+
+      // Ensure signal is correctly determined from composite score
+      const finalSignal = result.scores.compositeScore >= 65 ? 'BUY' : 
+                         result.scores.compositeScore <= 35 ? 'SELL' : 'HOLD';
+      
+      // Save to database
+      await storage.createQuantSignal({
+        symbol: symbol.toUpperCase(),
+        score: result.scores.compositeScore,
+        signal: finalSignal === 'BUY' ? 'Bullish' : finalSignal === 'SELL' ? 'Bearish' : 'Neutral',
+        confidence: result.confidence,
+        factors: {
+          trend: result.scores.trend,
+          momentum: result.scores.momentum,
+          volatility: result.scores.volatility,
+          volume: result.scores.volume,
+          risk: result.scores.risk,
+          sentiment: result.scores.sentiment
+        } as any,
+        explanation: `Composite: ${result.scores.compositeScore}, Regime: ${result.marketRegime}`,
+      });
+
+      res.json(result);
+    } catch (error) {
+      console.error(`Error in /api/quant/${req.params.symbol}:`, error);
+      res.status(500).json({ error: "Failed to calculate quant analysis" });
+    }
+  });
+
+  /**
+   * GET /api/quant/signal/:symbol
+   * Get trading signal for a symbol (lightweight endpoint)
+   */
+  app.get("/api/quant/signal/:symbol", async (req, res) => {
+    try {
+      const { symbol } = req.params;
+      const interval = (req.query.interval as '1h' | '1d') || '1d';
+      const cacheKey = `quant_${symbol.toUpperCase()}_${interval}`;
+
+      // Check cache first
+      const cached = quantCache.get<QuantEngineOutput>(cacheKey);
+      if (cached) {
+        return res.json({
+          symbol: cached.symbol,
+          signal: cached.signal,
+          compositeScore: cached.scores.compositeScore,
+          confidence: cached.confidence,
+          marketRegime: cached.marketRegime
+        });
+      }
+
+      // Fetch and calculate if not cached
+      const klines = await fetchOHLCData(symbol, interval, 200);
+      if (klines.length === 0) {
+        return res.status(404).json({ error: "No data available for symbol" });
+      }
+
+      const ohlc = klinesToOHLC(klines);
+      const { closes, volumes } = extractPriceVolume(klines);
+
+      const result = await runQuantEngine({
+        symbol: symbol.toUpperCase(),
+        prices: closes,
+        ohlc,
+        volumes,
+        interval,
+        sentimentScore: 50
+      });
+
+      quantCache.set(cacheKey, result, 60 * 1000);
+
+      res.json({
+        symbol: result.symbol,
+        signal: result.signal,
+        compositeScore: result.scores.compositeScore,
+        confidence: result.confidence,
+        marketRegime: result.marketRegime
+      });
+    } catch (error) {
+      console.error(`Error in /api/quant/signal/${req.params.symbol}:`, error);
+      res.status(500).json({ error: "Failed to calculate signal" });
+    }
+  });
+
+  /**
+   * GET /api/quant/score/:symbol (legacy endpoint, redirects to /api/quant/:symbol)
+   */
+  app.get("/api/quant/score/:symbol", async (req, res) => {
+    // Redirect to new endpoint
+    const { symbol } = req.params;
+    req.url = `/api/quant/${symbol}`;
+    return app._router.handle(req, res);
+  });
+
+  /**
    * GET /api/regime
-   * Calculate market regime
+   * Calculate market regime using unified quant engine
    */
   app.get("/api/regime", async (req, res) => {
     try {
+      const cacheKey = 'regime_btc_1d';
+      
+      // Check cache
+      const cached = quantCache.get<QuantEngineOutput>(cacheKey);
+      if (cached && cached.marketRegime) {
+        return res.json({
+          regime: cached.marketRegime,
+          volatility: cached.metrics.volatility.regime,
+          trendStrength: cached.scores.trend,
+          confidence: cached.confidence,
+          explanation: `Market regime: ${cached.marketRegime}, Volatility: ${cached.metrics.volatility.regime}, Trend: ${cached.scores.trend}/100`
+        });
+      }
+
       // Use BTC as benchmark
       const klines = await fetchOHLCData('BTC', '1d', 300);
 
@@ -203,24 +430,39 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       const ohlc = klinesToOHLC(klines);
-      const { closes } = extractPriceVolume(klines);
+      const { closes, volumes } = extractPriceVolume(klines);
 
-      // Calculate 200 EMA
-      const ema200 = exponentialMovingAverage(closes, 200);
+      // Run quant engine
+      const result = await runQuantEngine({
+        symbol: 'BTC',
+        prices: closes,
+        ohlc,
+        volumes,
+        interval: '1d',
+        sentimentScore: 50
+      });
 
-      // Calculate regime
-      const regime = calculateMarketRegime(closes, ohlc, ema200);
+      // Cache for 5 minutes
+      quantCache.set(cacheKey, result, 5 * 60 * 1000);
+
+      const regimeData = {
+        regime: result.marketRegime,
+        volatility: result.metrics.volatility.regime,
+        trendStrength: result.scores.trend,
+        confidence: result.confidence,
+        explanation: `Market regime: ${result.marketRegime}, Volatility: ${result.metrics.volatility.regime}, Trend: ${result.scores.trend}/100`
+      };
 
       // Save to database
       await storage.createRegimeLog({
-        regime: regime.regime,
-        volatility: regime.volatility,
-        trendStrength: regime.trendStrength,
-        confidence: regime.confidence,
-        explanation: regime.explanation,
+        regime: result.marketRegime,
+        volatility: result.metrics.volatility.regime,
+        trendStrength: result.scores.trend,
+        confidence: result.confidence,
+        explanation: regimeData.explanation,
       });
 
-      res.json(regime);
+      res.json(regimeData);
     } catch (error) {
       console.error("Error in /api/regime:", error);
       res.status(500).json({ error: "Failed to calculate market regime" });
@@ -261,10 +503,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
       const portfolio = portfolios[0];
       const trades = await storage.getTradesByPortfolioId(portfolio.id);
 
-      // Calculate holdings
+      // Calculate holdings and realized PnL from trades (recalculate from scratch)
       const holdings: Record<string, { quantity: number; avgEntry: number }> = {};
+      let totalRealizedPnl = 0;
 
-      for (const trade of trades) {
+      // Process trades in chronological order to calculate realized PnL correctly
+      const sortedTrades = [...trades].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+      for (const trade of sortedTrades) {
         const symbol = trade.symbol;
         const quantity = parseFloat(trade.quantity);
         const price = parseFloat(trade.buyPrice);
@@ -274,17 +520,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
         }
 
         if (trade.side === 'buy') {
+          // Buy trade: update holdings
           const prevTotal = holdings[symbol].quantity * holdings[symbol].avgEntry;
           holdings[symbol].quantity += quantity;
           holdings[symbol].avgEntry = (prevTotal + quantity * price) / holdings[symbol].quantity;
         } else {
+          // Sell trade: calculate realized PnL and reduce holdings
+          const avgEntry = holdings[symbol].avgEntry;
+          const realizedPnl = (price - avgEntry) * quantity;
+          totalRealizedPnl += realizedPnl;
+          
           holdings[symbol].quantity -= quantity;
+          
+          // If all sold, reset avgEntry
+          if (holdings[symbol].quantity <= 0.00000001) {
+            holdings[symbol].quantity = 0;
+            holdings[symbol].avgEntry = 0;
+          }
         }
       }
-
-      // Get realized PnL logs
-      const realizedPnlLogs = await storage.getRealizedPnlLogsByPortfolioId(portfolio.id);
-      const totalRealizedPnl = realizedPnlLogs.reduce((sum, log) => sum + parseFloat(log.realizedPnl), 0);
 
       // Calculate total value and unrealized PnL (fetch current prices)
       let totalValue = 0;
@@ -320,7 +574,6 @@ export async function registerRoutes(app: Express): Promise<Server> {
         realizedPnl: totalRealizedPnl,
         unrealizedPnl: totalUnrealizedPnl,
         totalPnl: totalRealizedPnl + totalUnrealizedPnl,
-        realizedPnlLogs,
       });
     } catch (error) {
       console.error(`Error in /api/portfolio/${req.params.userId}:`, error);
@@ -399,12 +652,18 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   /**
    * DELETE /api/portfolio/trade/:id
-   * Delete a trade
+   * Delete a trade and its associated realized PnL log
    */
   app.delete("/api/portfolio/trade/:id", async (req, res) => {
     try {
       const id = parseInt(req.params.id);
+      
+      // Delete associated realized PnL log first (if it exists)
+      await storage.deleteRealizedPnlLogByTradeId(id);
+      
+      // Then delete the trade
       await storage.deleteTrade(id);
+      
       res.json({ success: true });
     } catch (error) {
       console.error(`Error in /api/portfolio/trade/${req.params.id}:`, error);

@@ -137,53 +137,106 @@ export default function CoinDetail() {
                 <>
                   <div className="mb-6 flex flex-col items-center justify-center py-4 border-b border-white/5">
                     <div className={`text-4xl font-bold mb-1 ${
-                      quantScore.signal === 'Bullish' ? 'text-green-500' :
-                      quantScore.signal === 'Bearish' ? 'text-red-500' :
+                      quantScore.signal === 'BUY' || quantScore.signal === 'Bullish' ? 'text-green-500' :
+                      quantScore.signal === 'SELL' || quantScore.signal === 'Bearish' ? 'text-red-500' :
                       'text-yellow-500'
                     }`}>
-                      {quantScore.signal.toUpperCase()}
+                      {(quantScore.signal === 'BUY' ? 'BUY' : 
+                        quantScore.signal === 'SELL' ? 'SELL' : 
+                        quantScore.signal === 'HOLD' ? 'HOLD' :
+                        quantScore.signal === 'Bullish' ? 'BULLISH' :
+                        quantScore.signal === 'Bearish' ? 'BEARISH' :
+                        'NEUTRAL').toUpperCase()}
                     </div>
                     <div className="text-sm text-muted-foreground">
                       Confidence: <span className="text-foreground font-mono">{quantScore.confidence}%</span>
                     </div>
                   </div>
                   
-                  <div className="space-y-4">
+                  <div className="mb-4">
+                    <div className="flex justify-between text-sm mb-1">
+                      <span className="text-muted-foreground">Composite Score</span>
+                      <span className="font-mono font-bold text-lg">{quantScore.scores?.compositeScore || quantScore.score || 0}/100</span>
+                    </div>
+                    <div className="h-2 w-full bg-muted rounded-full overflow-hidden">
+                      <div className="h-full bg-gradient-to-r from-primary to-accent" style={{ width: `${quantScore.scores?.compositeScore || quantScore.score || 0}%` }} />
+                    </div>
+                  </div>
+
+                  <div className="space-y-3">
                     <div>
                       <div className="flex justify-between text-sm mb-1">
-                        <span className="text-muted-foreground">Trend Score</span>
-                        <span className="font-mono font-medium">{quantScore.factors.trend}/100</span>
+                        <span className="text-muted-foreground">Trend</span>
+                        <span className="font-mono font-medium">{quantScore.scores?.trend || quantScore.factors?.trend || 0}/100</span>
                       </div>
                       <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
-                        <div className="h-full bg-primary" style={{ width: `${quantScore.factors.trend}%` }} />
+                        <div className="h-full bg-primary" style={{ width: `${quantScore.scores?.trend || quantScore.factors?.trend || 0}%` }} />
                       </div>
                     </div>
                     <div>
                       <div className="flex justify-between text-sm mb-1">
                         <span className="text-muted-foreground">Momentum</span>
-                        <span className="font-mono font-medium">{quantScore.factors.momentum}/100</span>
+                        <span className="font-mono font-medium">{quantScore.scores?.momentum || quantScore.factors?.momentum || 0}/100</span>
                       </div>
                       <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
-                        <div className="h-full bg-purple-500" style={{ width: `${quantScore.factors.momentum}%` }} />
+                        <div className="h-full bg-purple-500" style={{ width: `${quantScore.scores?.momentum || quantScore.factors?.momentum || 0}%` }} />
+                      </div>
+                    </div>
+                    <div>
+                      <div className="flex justify-between text-sm mb-1">
+                        <span className="text-muted-foreground">Volatility</span>
+                        <span className="font-mono font-medium">{quantScore.scores?.volatility || quantScore.factors?.volatility || 0}/100</span>
+                      </div>
+                      <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
+                        <div className="h-full bg-blue-500" style={{ width: `${quantScore.scores?.volatility || quantScore.factors?.volatility || 0}%` }} />
                       </div>
                     </div>
                     <div>
                       <div className="flex justify-between text-sm mb-1">
                         <span className="text-muted-foreground">Volume</span>
-                        <span className="font-mono font-medium">{quantScore.factors.volume}/100</span>
+                        <span className="font-mono font-medium">{quantScore.scores?.volume || quantScore.factors?.volume || 0}/100</span>
                       </div>
                       <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
-                        <div className="h-full bg-yellow-500" style={{ width: `${quantScore.factors.volume}%` }} />
+                        <div className="h-full bg-yellow-500" style={{ width: `${quantScore.scores?.volume || quantScore.factors?.volume || 0}%` }} />
                       </div>
                     </div>
+                    <div>
+                      <div className="flex justify-between text-sm mb-1">
+                        <span className="text-muted-foreground">Risk</span>
+                        <span className="font-mono font-medium">{quantScore.scores?.risk || 0}/100</span>
+                      </div>
+                      <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
+                        <div className="h-full bg-red-500" style={{ width: `${quantScore.scores?.risk || 0}%` }} />
+                      </div>
+                    </div>
+                    {quantScore.scores?.sentiment !== undefined && (
+                      <div>
+                        <div className="flex justify-between text-sm mb-1">
+                          <span className="text-muted-foreground">Sentiment</span>
+                          <span className="font-mono font-medium">{quantScore.scores.sentiment}/100</span>
+                        </div>
+                        <div className="h-1.5 w-full bg-muted rounded-full overflow-hidden">
+                          <div className="h-full bg-green-500" style={{ width: `${quantScore.scores.sentiment}%` }} />
+                        </div>
+                      </div>
+                    )}
                   </div>
+
+                  {quantScore.marketRegime && (
+                    <div className="mt-4 p-3 bg-muted/30 rounded-lg border border-white/5">
+                      <div className="text-xs text-muted-foreground mb-1">Market Regime</div>
+                      <div className="font-bold text-sm uppercase">{quantScore.marketRegime}</div>
+                    </div>
+                  )}
                   
-                  <div className="mt-6 p-3 bg-muted/30 rounded-lg border border-white/5">
-                     <p className="text-xs text-muted-foreground leading-relaxed">
-                       <Zap className="h-3 w-3 inline mr-1 text-yellow-500" />
-                       {quantScore.explanation}
-                     </p>
-                  </div>
+                  {quantScore.explanation && (
+                    <div className="mt-4 p-3 bg-muted/30 rounded-lg border border-white/5">
+                      <p className="text-xs text-muted-foreground leading-relaxed">
+                        <Zap className="h-3 w-3 inline mr-1 text-yellow-500" />
+                        {quantScore.explanation}
+                      </p>
+                    </div>
+                  )}
                 </>
               ) : (
                 <p className="text-muted-foreground text-sm">Failed to load quant score</p>
