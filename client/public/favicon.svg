@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 180 180">
+  <!-- Background -->
+  <rect width="180" height="180" fill="#0f172a" rx="32"/>
+  
+  <!-- Gradient for the icon -->
+  <defs>
+    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00d9ff;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0099cc;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="grad2" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#ff6b35;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#ff8c42;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Rising chart lines (cyan) -->
+  <path d="M 40 120 L 60 100 L 80 110 L 100 70 L 120 80 L 140 40" 
+        stroke="url(#grad1)" stroke-width="8" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  
+  <!-- Accent dots (orange) -->
+  <circle cx="100" cy="70" r="6" fill="url(#grad2)"/>
+  <circle cx="120" cy="80" r="6" fill="url(#grad2)"/>
+  <circle cx="140" cy="40" r="6" fill="url(#grad2)"/>
+</svg>
