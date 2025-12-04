@@ -1,18 +1,40 @@
 import OpenAI from 'openai';
-import { fetchOHLCData, klinesToOHLC, extractPriceVolume, fetchTopCoins } from './marketData';
+import { fetchOHLCData, klinesToOHLC, extractPriceVolume, fetchTopCoins, fetchCurrentPrice } from './marketData';
 import { runQuantEngine, type QuantEngineOutput } from './quant/engine';
 import { quantCache } from './cache';
 
-// Initialize OpenAI client for GPT
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
+// Lazy initialization of OpenAI client for GPT
+let openai: OpenAI | null = null;
+function getOpenAIClient(): OpenAI {
+  if (!openai) {
+    // Check for both OPENAI_API_KEY and AI_INTEGRATIONS_OPENAI_API_KEY (Replit compatibility)
+    const apiKey = process.env.OPENAI_API_KEY || process.env.AI_INTEGRATIONS_OPENAI_API_KEY;
+    if (!apiKey) {
+      throw new Error('OPENAI_API_KEY or AI_INTEGRATIONS_OPENAI_API_KEY environment variable is not set. Please add it to your .env file in the project root.');
+    }
+    
+    // Use base URL if provided (for Replit integrations)
+    const baseURL = process.env.AI_INTEGRATIONS_OPENAI_BASE_URL || undefined;
+    
+    openai = new OpenAI({
+      apiKey: apiKey,
+      ...(baseURL && { baseURL }),
+    });
+  }
+  return openai;
+}
 
-// Initialize Grok client
-const grokClient = new OpenAI({
-  apiKey: process.env.XAI_API_KEY,
-  baseURL: 'https://api.x.ai/v1',
-});
+// Lazy initialization of Grok client (only if API key exists)
+let grokClient: OpenAI | null = null;
+function getGrokClient(): OpenAI | null {
+  if (!grokClient && process.env.XAI_API_KEY) {
+    grokClient = new OpenAI({
+      apiKey: process.env.XAI_API_KEY,
+      baseURL: 'https://api.x.ai/v1',
+    });
+  }
+  return grokClient;
+}
 
 // Cache for top 50 coins symbol mapping
 let top50CoinsCache: Array<{ symbol: string; name: string }> | null = null;
@@ -84,16 +106,125 @@ async function extractSymbol(message: string): Promise<string | null> {
 }
 
 /**
- * Get sentiment analysis from Grok with fallback to OpenAI
+ * Detect user intent using GPT
+ * Returns: { intent: string, symbol: string | null, isMarketWide: boolean, scenario?: string }
+ */
+async function detectIntent(userMessage: string): Promise<{
+  intent: 'price' | 'future' | 'bullish' | 'bearish' | 'market' | 'risk' | 'portfolio' | 'general';
+  symbol: string | null;
+  isMarketWide: boolean;
+  scenario?: string;
+}> {
+  try {
+    // First, try to extract symbol
+    const symbol = await extractSymbol(userMessage);
+    
+    const client = getOpenAIClient();
+    const response = await client.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        {
+          role: 'system',
+          content: `You are an intent classifier for a cryptocurrency trading assistant. Analyze the user's question and classify it into one of these categories:
+- price: Questions about current price, price movements, price levels
+- future: Questions about future price scenarios (e.g., "if BTC drops to 86k should I buy?")
+- bullish: Questions asking about bullish signals, buying opportunities
+- bearish: Questions asking about bearish signals, selling opportunities
+- market: Questions about overall market conditions, market-wide analysis
+- risk: Questions about risk assessment, risk factors
+- portfolio: Questions about portfolio management, diversification
+- general: General questions not fitting above categories
+
+Also detect if the question is market-wide (no specific coin) or coin-specific.
+
+If the question contains a future scenario (e.g., "if X drops to Y"), extract the scenario.
+
+Respond in JSON format: {"intent": "category", "isMarketWide": boolean, "scenario": "scenario text if applicable"}`
+        },
+        {
+          role: 'user',
+          content: userMessage
+        }
+      ],
+      temperature: 0.3,
+      max_tokens: 200,
+      response_format: { type: 'json_object' }
+    });
+    
+    const content = response.choices[0]?.message?.content || '{}';
+    const parsed = JSON.parse(content);
+    
+    return {
+      intent: parsed.intent || 'general',
+      symbol: symbol,
+      isMarketWide: parsed.isMarketWide || (!symbol && true),
+      scenario: parsed.scenario
+    };
+  } catch (error) {
+    console.error('Error detecting intent:', error);
+    // Fallback: extract symbol and guess intent
+    const symbol = await extractSymbol(userMessage);
+    return {
+      intent: 'general',
+      symbol: symbol,
+      isMarketWide: !symbol
+    };
+  }
+}
+
+/**
+ * Derive whale flow score from volume and price metrics
+ * Returns 0-100 score (higher = more whale activity)
+ */
+function deriveWhaleFlow(quantData: QuantEngineOutput): number {
+  const volumeZ = quantData.metrics.volume.volumeZScore;
+  const volumeScore = quantData.scores.volume;
+  const momentum = quantData.scores.momentum;
+  
+  // Large volume spikes (z-score > 2) indicate whale activity
+  const whaleActivity = Math.min(100, Math.max(0, 50 + volumeZ * 10));
+  
+  // Combine with volume score and momentum
+  const whaleFlow = (whaleActivity * 0.5 + volumeScore * 0.3 + momentum * 0.2);
+  
+  return Math.round(Math.max(0, Math.min(100, whaleFlow)));
+}
+
+/**
+ * Derive liquidity score from volume and volatility metrics
+ * Returns 0-100 score (higher = better liquidity)
+ */
+function deriveLiquidityScore(quantData: QuantEngineOutput): number {
+  const volumeScore = quantData.scores.volume;
+  const volatilityScore = quantData.scores.volatility;
+  const volumeZ = quantData.metrics.volume.volumeZScore;
+  
+  // High volume + moderate volatility = good liquidity
+  // Very low volatility might indicate low liquidity (stablecoins)
+  const liquidityBase = (volumeScore * 0.6 + volatilityScore * 0.4);
+  
+  // Adjust based on volume z-score (recent activity)
+  const liquidityAdjusted = liquidityBase + (volumeZ > 0 ? Math.min(10, volumeZ * 2) : Math.max(-10, volumeZ * 2));
+  
+  return Math.round(Math.max(0, Math.min(100, liquidityAdjusted)));
+}
+
+/**
+ * Get sentiment analysis from Grok (if available) or return neutral
  * Returns both sentiment text and numeric score (0-100)
  */
-async function getSentimentAnalysis(symbol: string, marketData: string): Promise<{ text: string; score: number }> {
-  let sentimentText = '';
-  let sentimentScore = 50; // Default neutral
+async function getSentimentAnalysis(symbol: string, marketSnapshot: string): Promise<{ text: string; score: number }> {
+  // Only use Grok if API key exists
+  const grok = getGrokClient();
+  if (!grok || !process.env.XAI_API_KEY) {
+    return {
+      text: 'Sentiment data unavailable. Grok API key not configured.',
+      score: 50 // Neutral
+    };
+  }
 
-  // Try Grok first
   try {
-    const grokResponse = await grokClient.chat.completions.create({
+    const grokResponse = await grok.chat.completions.create({
       model: 'grok-beta',
       messages: [
         {
@@ -102,227 +233,537 @@ async function getSentimentAnalysis(symbol: string, marketData: string): Promise
         },
         {
           role: 'user',
-          content: `Analyze the sentiment for ${symbol} based on this market data:\n${marketData}`
+          content: `Analyze the sentiment for ${symbol} based on this market data:\n${marketSnapshot}`
         }
       ],
       temperature: 0.7,
       max_tokens: 200,
     });
     
-    sentimentText = grokResponse.choices[0]?.message?.content || '';
+    const sentimentText = grokResponse.choices[0]?.message?.content || '';
     
     // Extract score from response
     const scoreMatch = sentimentText.match(/SCORE:\s*(\d+)/i);
+    let sentimentScore = 50; // Default neutral
     if (scoreMatch) {
       sentimentScore = parseInt(scoreMatch[1], 10);
       sentimentScore = Math.max(0, Math.min(100, sentimentScore));
     }
     
     // Clean up text (remove SCORE part)
-    sentimentText = sentimentText.replace(/SCORE:\s*\d+/i, '').replace(/SENTIMENT:/i, '').trim();
+    const cleanedText = sentimentText.replace(/SCORE:\s*\d+/i, '').replace(/SENTIMENT:/i, '').trim();
     
-    if (sentimentText) {
-      return { text: sentimentText, score: sentimentScore };
-    }
+    return {
+      text: cleanedText || 'Sentiment analysis unavailable.',
+      score: sentimentScore
+    };
   } catch (error) {
-    console.error('Grok API error, falling back to OpenAI:', error);
-  }
-
-  // Fallback to OpenAI
-  try {
-    const openaiResponse = await openai.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a cryptocurrency market sentiment analyst. Analyze the provided market data and provide a brief sentiment analysis (2-3 sentences) covering market mood, social trends, and news sentiment. Also provide a sentiment score from 0-100 where 0 is very bearish, 50 is neutral, and 100 is very bullish. Format your response as: "SENTIMENT: [your analysis text] SCORE: [number 0-100]"'
-        },
-        {
-          role: 'user',
-          content: `Analyze the sentiment for ${symbol} based on this market data:\n${marketData}`
-        }
-      ],
-      temperature: 0.7,
-      max_tokens: 200,
-    });
-    
-    sentimentText = openaiResponse.choices[0]?.message?.content || '';
-    
-    // Extract score
-    const scoreMatch = sentimentText.match(/SCORE:\s*(\d+)/i);
-    if (scoreMatch) {
-      sentimentScore = parseInt(scoreMatch[1], 10);
-      sentimentScore = Math.max(0, Math.min(100, sentimentScore));
-    }
-    
-    // Clean up text
-    sentimentText = sentimentText.replace(/SCORE:\s*\d+/i, '').replace(/SENTIMENT:/i, '').trim();
-    
-    return { text: sentimentText || 'Sentiment analysis unavailable.', score: sentimentScore };
-  } catch (error) {
-    console.error('OpenAI sentiment API error:', error);
-    return { text: 'Sentiment analysis unavailable.', score: 50 };
+    console.error('Grok API error:', error);
+    return {
+      text: 'Sentiment analysis unavailable. API error occurred.',
+      score: 50 // Neutral fallback
+    };
   }
 }
 
 /**
- * Get trading signal from GPT with enhanced quant data
+ * Compute weighted final signal
+ * Formula: 0.80 * mathModelSignalValue + 0.10 * sentimentScore + 0.10 * gptInterpretationScore
  */
-async function getTradingSignalFromGPT(
+function computeWeightedSignal(
+  quantSignal: 'BUY' | 'SELL' | 'HOLD',
+  sentimentScore: number,
+  gptInterpretationScore: number
+): 'BUY' | 'SELL' | 'HOLD' {
+  // Convert quant signal to numeric (BUY=1, HOLD=0.5, SELL=0)
+  const mathModelSignalValue = quantSignal === 'BUY' ? 1 : quantSignal === 'SELL' ? 0 : 0.5;
+  
+  // Normalize sentiment to [0-1]
+  const sentimentNormalized = sentimentScore / 100;
+  
+  // Normalize GPT interpretation to [0-1]
+  const gptNormalized = gptInterpretationScore / 100;
+  
+  // Weighted combination
+  const finalSignalValue = 
+    0.80 * mathModelSignalValue +
+    0.10 * sentimentNormalized +
+    0.10 * gptNormalized;
+  
+  // Apply thresholds
+  if (finalSignalValue > 0.67) return 'BUY';
+  if (finalSignalValue < 0.38) return 'SELL';
+  return 'HOLD';
+}
+
+/**
+ * Get GPT interpretation score (directional confidence from GPT reasoning)
+ * Returns 0-100 score
+ */
+async function getGPTInterpretationScore(
   symbol: string,
-  quantData: any,
+  quantData: QuantEngineOutput,
   sentimentText: string,
-  sentimentScore: number
-): Promise<{ signal: string; reasoning: string }> {
+  sentimentScore: number,
+  userQuestion: string,
+  scenario?: string
+): Promise<{ score: number; reasoning: string }> {
   try {
-    const response = await openai.chat.completions.create({
+    const client = getOpenAIClient();
+    const prompt = scenario 
+      ? `User question: "${userQuestion}"
+      
+Scenario: ${scenario}
+
+Quantitative Analysis for ${symbol}:
+- Composite Score: ${quantData.scores.compositeScore}/100
+- Signal: ${quantData.signal}
+- Market Regime: ${quantData.marketRegime}
+- Trend: ${quantData.scores.trend}/100
+- Momentum: ${quantData.scores.momentum}/100
+- Volatility: ${quantData.scores.volatility}/100
+- Volume: ${quantData.scores.volume}/100
+- Risk: ${quantData.scores.risk}/100
+- Confidence: ${quantData.confidence}%
+- Forecast Direction: ${quantData.forecast?.direction}
+- Forecast Probability: ${quantData.forecast?.probability}%
+- Trend Continuation: ${quantData.forecast?.trendContinuation}%
+- Trend Reversal: ${quantData.forecast?.trendReversal}%
+- Support: $${quantData.forecast?.support?.toFixed(2)}
+- Resistance: $${quantData.forecast?.resistance?.toFixed(2)}
+- RSI: ${quantData.metrics.momentum.rsi.toFixed(1)}
+- MACD Histogram: ${quantData.metrics.trend.macdHistogram.toFixed(4)}
+
+Sentiment Analysis:
+${sentimentText}
+Sentiment Score: ${sentimentScore}/100
+
+Analyze this scenario and provide:
+1. A directional confidence score (0-100) where 0 is very bearish, 50 is neutral, 100 is very bullish
+2. Brief reasoning (2-3 sentences) explaining your confidence level
+
+Consider the scenario context, support/resistance levels, risk-to-reward ratio, and current market conditions.
+
+Respond in JSON: {"score": number, "reasoning": "text"}`
+      : `User question: "${userQuestion}"
+
+Quantitative Analysis for ${symbol}:
+- Composite Score: ${quantData.scores.compositeScore}/100
+- Signal: ${quantData.signal}
+- Market Regime: ${quantData.marketRegime}
+- Trend: ${quantData.scores.trend}/100
+- Momentum: ${quantData.scores.momentum}/100
+- Volatility: ${quantData.scores.volatility}/100
+- Volume: ${quantData.scores.volume}/100
+- Risk: ${quantData.scores.risk}/100
+- Confidence: ${quantData.confidence}%
+- Forecast Direction: ${quantData.forecast?.direction}
+- Forecast Probability: ${quantData.forecast?.probability}%
+- Trend Continuation: ${quantData.forecast?.trendContinuation}%
+- Trend Reversal: ${quantData.forecast?.trendReversal}%
+- Support: $${quantData.forecast?.support?.toFixed(2)}
+- Resistance: $${quantData.forecast?.resistance?.toFixed(2)}
+- RSI: ${quantData.metrics.momentum.rsi.toFixed(1)}
+- MACD Histogram: ${quantData.metrics.trend.macdHistogram.toFixed(4)}
+
+Sentiment Analysis:
+${sentimentText}
+Sentiment Score: ${sentimentScore}/100
+
+Based on the quantitative data and sentiment, provide:
+1. A directional confidence score (0-100) where 0 is very bearish, 50 is neutral, 100 is very bullish
+2. Brief reasoning (2-3 sentences) explaining your confidence level
+
+Respond in JSON: {"score": number, "reasoning": "text"}`;
+
+    const response = await client.chat.completions.create({
       model: 'gpt-4o',
       messages: [
         {
           role: 'system',
-          content: 'You are an expert cryptocurrency trading analyst. Based on comprehensive quantitative data and sentiment analysis, provide a clear BUY, SELL, or HOLD signal with brief reasoning (2-3 sentences). Consider all technical indicators, market sentiment, risk factors, and regime classification.'
+          content: 'You are an expert cryptocurrency trading analyst. Analyze quantitative data and provide directional confidence scores with clear reasoning.'
         },
         {
           role: 'user',
-          content: `Provide a trading signal for ${symbol}.\n\nQuantitative Analysis:\n- Composite Score: ${quantData.scores.compositeScore}/100\n- Signal: ${quantData.signal}\n- Market Regime: ${quantData.marketRegime}\n- Trend: ${quantData.scores.trend}/100\n- Momentum: ${quantData.scores.momentum}/100\n- Volatility: ${quantData.scores.volatility}/100\n- Volume: ${quantData.scores.volume}/100\n- Risk: ${quantData.scores.risk}/100\n- Confidence: ${quantData.confidence}%\n\nSentiment Analysis:\n${sentimentText}\nSentiment Score: ${sentimentScore}/100\n\nProvide your signal (BUY/SELL/HOLD) and reasoning.`
+          content: prompt
         }
       ],
       temperature: 0.3,
-      max_tokens: 250,
+      max_tokens: 300,
+      response_format: { type: 'json_object' }
     });
     
-    const content = response.choices[0]?.message?.content || '';
-    
-    // Extract signal (prefer quant engine signal, but allow GPT override)
-    let signal = quantData.signal; // Use quant engine signal as base
-    if (content.toUpperCase().includes('BUY') && !content.toUpperCase().includes('NOT BUY')) {
-      signal = 'BUY';
-    } else if (content.toUpperCase().includes('SELL')) {
-      signal = 'SELL';
-    } else if (content.toUpperCase().includes('HOLD')) {
-      signal = 'HOLD';
-    }
+    const content = response.choices[0]?.message?.content || '{}';
+    const parsed = JSON.parse(content);
     
     return {
-      signal,
-      reasoning: content
+      score: Math.max(0, Math.min(100, parsed.score || 50)),
+      reasoning: parsed.reasoning || 'Analysis based on quantitative metrics.'
     };
   } catch (error) {
-    console.error('GPT API error:', error);
+    console.error('GPT interpretation error:', error);
     return {
-      signal: quantData.signal, // Fallback to quant engine signal
-      reasoning: 'Unable to generate enhanced trading signal. Using quantitative analysis signal.'
+      score: 50, // Neutral fallback
+      reasoning: 'Unable to generate interpretation. Using quantitative signal.'
     };
   }
 }
 
 /**
- * Main chat handler with AI integration
- * Full pipeline: symbol extractor → quant engine → Grok sentiment → OpenAI formatting
+ * Format comprehensive AI response
  */
-export async function processAIChat(message: string): Promise<string> {
-  // 1. Extract symbol (supports top 50 coins)
-  const symbol = await extractSymbol(message);
+function formatResponse(
+  symbol: string | 'MARKET',
+  quantData: QuantEngineOutput,
+  sentiment: { text: string; score: number },
+  finalSignal: 'BUY' | 'SELL' | 'HOLD',
+  gptReasoning: string,
+  whaleFlow: number,
+  liquidityScore: number,
+  currentPrice: number,
+  priceChange: number
+): string {
+  const signalEmoji = finalSignal === 'BUY' ? '🟢' : finalSignal === 'SELL' ? '🔴' : '🟡';
   
-  // If no symbol found, provide general market overview
-  if (!symbol) {
-    return "I can provide AI-powered crypto analysis! Ask me about specific coins from the top 50 cryptocurrencies.\n\nExample: \"Should I buy Bitcoin?\" or \"What's the market sentiment for Ethereum?\" or \"Analyze SOL\"";
+  // Detect overheated/oversold states
+  const rsi = quantData.metrics.momentum.rsi;
+  const overheated = rsi > 70;
+  const oversold = rsi < 30;
+  
+  // Detect reversal conditions
+  const reversalRisk = quantData.forecast?.trendReversal || 0;
+  const continuationStrength = quantData.forecast?.trendContinuation || 0;
+  
+  // Detect dip/FOMO conditions
+  const isDip = quantData.scores.momentum < 40 && quantData.scores.trend < 50 && quantData.marketRegime !== 'bull';
+  const isFOMO = quantData.scores.momentum > 70 && quantData.scores.trend > 65 && quantData.marketRegime === 'bull';
+  
+  let reasoning = `**Trend Analysis:** `;
+  if (quantData.scores.trend > 65) {
+    reasoning += `Strong ${quantData.metrics.trend.trendDirection.toLowerCase()}ward trend with slope ${quantData.metrics.trend.slope.toFixed(4)}. `;
+  } else if (quantData.scores.trend < 35) {
+    reasoning += `Weak or declining trend. `;
+  } else {
+    reasoning += `Moderate trend strength. `;
   }
   
+  reasoning += `\n\n**Momentum:** `;
+  if (quantData.scores.momentum > 65) {
+    reasoning += `Strong bullish momentum (RSI: ${rsi.toFixed(1)}). `;
+  } else if (quantData.scores.momentum < 35) {
+    reasoning += `Weak momentum, potential oversold conditions. `;
+  } else {
+    reasoning += `Moderate momentum. `;
+  }
+  
+  reasoning += `\n\n**Volatility:** `;
+  reasoning += `${quantData.metrics.volatility.regime.toLowerCase()} volatility environment (${quantData.metrics.volatility.historicalVol.toFixed(2)}%). `;
+  
+  reasoning += `\n\n**Volume & Liquidity:** `;
+  reasoning += `${quantData.metrics.volume.priceVolumeConfirmation}. `;
+  reasoning += `Whale flow score: ${whaleFlow}/100, Liquidity: ${liquidityScore}/100. `;
+  
+  reasoning += `\n\n**Market Regime:** `;
+  reasoning += `${quantData.marketRegime.toUpperCase()} market with ${quantData.confidence}% confidence. `;
+  
+  if (overheated) {
+    reasoning += `⚠️ **Overheated:** RSI above 70 suggests potential pullback. `;
+  }
+  if (oversold) {
+    reasoning += `📉 **Oversold:** RSI below 30 suggests potential bounce. `;
+  }
+  if (reversalRisk > 60) {
+    reasoning += `🔄 **Reversal Risk:** ${reversalRisk}% probability of trend reversal. `;
+  }
+  if (continuationStrength > 70) {
+    reasoning += `✅ **Trend Continuation:** ${continuationStrength}% probability of continuation. `;
+  }
+  if (isDip) {
+    reasoning += `💧 **Dip Opportunity:** Current conditions suggest potential buying opportunity. `;
+  }
+  if (isFOMO) {
+    reasoning += `🚀 **FOMO Conditions:** Strong momentum may indicate overextension. `;
+  }
+  
+  reasoning += `\n\n**Sentiment Impact:** `;
+  if (sentiment.score > 60) {
+    reasoning += `Bullish sentiment (${sentiment.score}/100) supports upward movement. `;
+  } else if (sentiment.score < 40) {
+    reasoning += `Bearish sentiment (${sentiment.score}/100) may pressure prices. `;
+  } else {
+    reasoning += `Neutral sentiment (${sentiment.score}/100). `;
+  }
+  
+  const decisionLogic = `The weighted signal combines:
+- **80%** Quantitative Model: ${quantData.signal} (Composite Score: ${quantData.scores.compositeScore}/100)
+- **10%** Sentiment Analysis: ${sentiment.score}/100
+- **10%** GPT Interpretation: Based on scenario analysis
+
+Final weighted value: ${finalSignal === 'BUY' ? '>0.67' : finalSignal === 'SELL' ? '<0.38' : '0.38-0.67'} → **${finalSignal}**`;
+
+  return `## AI Market Analysis for ${symbol}
+
+### ${signalEmoji} Final Signal: ${finalSignal}
+### 📈 Composite Score: ${quantData.scores.compositeScore}%
+
+### Reasoning
+${reasoning}
+
+### Quant Breakdown
+• **Trend:** ${quantData.scores.trend}/100  
+• **Momentum:** ${quantData.scores.momentum}/100  
+• **Volatility:** ${quantData.scores.volatility}/100  
+• **Volume:** ${quantData.scores.volume}/100  
+• **Risk:** ${quantData.scores.risk}/100  
+• **Liquidity:** ${liquidityScore}/100  
+• **Whale Flow:** ${whaleFlow}/100  
+• **Regime:** ${quantData.marketRegime.toUpperCase()}  
+
+### Sentiment Summary
+${sentiment.text}
+
+### Decision Logic
+${decisionLogic}
+
+### Additional Context
+• **Forecast Direction:** ${quantData.forecast?.direction} (${quantData.forecast?.probability}% probability)
+• **Support:** $${quantData.forecast?.support?.toFixed(2)}
+• **Resistance:** $${quantData.forecast?.resistance?.toFixed(2)}
+• **Current Price:** $${currentPrice.toFixed(2)} | **Change:** ${priceChange >= 0 ? '+' : ''}${priceChange.toFixed(2)}%`;
+}
+
+/**
+ * Analyze multiple coins for market-wide queries
+ */
+async function analyzeTopCoins(limit: number = 50): Promise<Array<{
+  symbol: string;
+  quantData: QuantEngineOutput;
+  whaleFlow: number;
+  liquidityScore: number;
+}>> {
+  const coins = await getTop50Coins();
+  const results: Array<{
+    symbol: string;
+    quantData: QuantEngineOutput;
+    whaleFlow: number;
+    liquidityScore: number;
+  }> = [];
+  
+  // Analyze top coins (limit to avoid rate limits)
+  const coinsToAnalyze = coins.slice(0, Math.min(limit, 50));
+  
+  for (const coin of coinsToAnalyze) {
+    try {
+      const klines = await fetchOHLCData(coin.symbol, '1d', 200);
+      if (klines.length === 0) continue;
+      
+      const ohlc = klinesToOHLC(klines);
+      const { closes, volumes } = extractPriceVolume(klines);
+      
+      const quantData = await runQuantEngine({
+        symbol: coin.symbol,
+        prices: closes,
+        ohlc,
+        volumes,
+        interval: '1d',
+        sentimentScore: 50 // Will be updated later if needed
+      });
+      
+      const whaleFlow = deriveWhaleFlow(quantData);
+      const liquidityScore = deriveLiquidityScore(quantData);
+      
+      results.push({
+        symbol: coin.symbol,
+        quantData,
+        whaleFlow,
+        liquidityScore
+      });
+    } catch (error) {
+      console.error(`Error analyzing ${coin.symbol}:`, error);
+      continue;
+    }
+  }
+  
+  return results;
+}
+
+/**
+ * Generate market-wide response for general questions
+ */
+async function generateMarketWideResponse(userQuestion: string): Promise<string> {
   try {
-    // 2. Fetch quantitative data using unified engine
-    const cacheKey = `quant_${symbol}_1d`;
-    let quantResult: QuantEngineOutput | null = quantCache.get<QuantEngineOutput>(cacheKey);
+    // Analyze top coins
+    const analyses = await analyzeTopCoins(50);
     
-    if (!quantResult) {
-      const klines = await fetchOHLCData(symbol, '1d', 200);
+    // Filter for bullish opportunities
+    const bullishCoins = analyses
+      .filter(a => 
+        a.quantData.scores.trend > 60 &&
+        a.quantData.scores.momentum > 60 &&
+        a.quantData.scores.compositeScore > 65 &&
+        a.quantData.marketRegime === 'bull' &&
+        a.quantData.signal === 'BUY'
+      )
+      .sort((a, b) => b.quantData.scores.compositeScore - a.quantData.scores.compositeScore)
+      .slice(0, 3);
+    
+    if (bullishCoins.length === 0) {
+      // No strong bullish signals, provide market overview
+      const avgComposite = analyses.reduce((sum, a) => sum + a.quantData.scores.compositeScore, 0) / analyses.length;
+      const bullCount = analyses.filter(a => a.quantData.marketRegime === 'bull').length;
+      const bearCount = analyses.filter(a => a.quantData.marketRegime === 'bear').length;
       
-      if (klines.length === 0) {
-        return `Unable to fetch market data for ${symbol}. Please try another coin.`;
-      }
-      
-      const ohlc = klinesToOHLC(klines);
-      const { closes, volumes } = extractPriceVolume(klines);
-      
-      // Run unified quant engine
-      quantResult = await runQuantEngine({
-        symbol,
-        prices: closes,
-        ohlc,
-        volumes,
-        interval: '1d',
-        sentimentScore: 50 // Will be updated with sentiment API
-      });
-      
-      // Cache for 1 minute
-      quantCache.set(cacheKey, quantResult, 60 * 1000);
+      return `## Market-Wide Analysis
+
+### Current Market Overview
+• **Average Composite Score:** ${avgComposite.toFixed(1)}/100
+• **Bull Markets:** ${bullCount} coins
+• **Bear Markets:** ${bearCount} coins
+• **Sideways Markets:** ${analyses.length - bullCount - bearCount} coins
+
+### Market Assessment
+Based on analysis of top ${analyses.length} cryptocurrencies, the market is currently showing **${avgComposite > 55 ? 'moderate bullish' : avgComposite < 45 ? 'bearish' : 'neutral'}** conditions.
+
+**No strong BUY signals** detected at this time. Consider:
+- Waiting for clearer signals
+- Focusing on coins with Composite Score > 65
+- Monitoring for regime changes
+
+### Top Opportunities (by Composite Score)
+${analyses
+  .sort((a, b) => b.quantData.scores.compositeScore - a.quantData.scores.compositeScore)
+  .slice(0, 5)
+  .map((a, i) => `${i + 1}. **${a.symbol}**: Score ${a.quantData.scores.compositeScore}/100, Signal: ${a.quantData.signal}, Regime: ${a.quantData.marketRegime.toUpperCase()}`)
+  .join('\n')}`;
     }
     
-    // 3. Prepare market data summary for sentiment analysis
-    const currentPrice = quantResult.metrics.trend.slope > 0 
-      ? quantResult.metrics.trend.slope 
-      : 0; // We'll get price from market data
+    // Format bullish opportunities
+    let response = `## Market-Wide Analysis: Bullish Opportunities\n\n`;
+    response += `Found **${bullishCoins.length}** coins with strong BUY signals:\n\n`;
     
-    // Fetch current price separately
-    const { fetchCurrentPrice } = await import('./marketData');
-    const price = await fetchCurrentPrice(symbol) || 0;
-    
-    const priceChange = quantResult.metrics.momentum.roc || 0;
-    const marketDataSummary = `Symbol: ${symbol}\nCurrent Price: $${price.toFixed(2)}\nPrice Change: ${priceChange.toFixed(2)}%\nComposite Score: ${quantResult.scores.compositeScore}/100\nSignal: ${quantResult.signal}\nMarket Regime: ${quantResult.marketRegime}\nTrend: ${quantResult.scores.trend}/100\nMomentum: ${quantResult.scores.momentum}/100\nRisk: ${quantResult.scores.risk}/100`;
-    
-    // 4. Get sentiment analysis (Grok with OpenAI fallback)
-    const sentiment = await getSentimentAnalysis(symbol, marketDataSummary);
-    
-    // 5. Re-run quant engine with actual sentiment score
-    if (sentiment.score !== 50) {
-      const klines = await fetchOHLCData(symbol, '1d', 200);
-      const ohlc = klinesToOHLC(klines);
-      const { closes, volumes } = extractPriceVolume(klines);
-      
-      quantResult = await runQuantEngine({
-        symbol,
-        prices: closes,
-        ohlc,
-        volumes,
-        interval: '1d',
-        sentimentScore: sentiment.score
-      });
-      
-      quantCache.set(cacheKey, quantResult, 60 * 1000);
+    for (const coin of bullishCoins) {
+      const price = await fetchCurrentPrice(coin.symbol) || 0;
+      response += `### 🟢 ${coin.symbol}\n`;
+      response += `• **Composite Score:** ${coin.quantData.scores.compositeScore}/100\n`;
+      response += `• **Trend:** ${coin.quantData.scores.trend}/100\n`;
+      response += `• **Momentum:** ${coin.quantData.scores.momentum}/100\n`;
+      response += `• **Whale Flow:** ${coin.whaleFlow}/100\n`;
+      response += `• **Liquidity:** ${coin.liquidityScore}/100\n`;
+      response += `• **Current Price:** $${price.toFixed(2)}\n`;
+      response += `• **Reason:** Strong trend and momentum with bullish regime\n\n`;
     }
-    
-    // 6. Get enhanced trading signal from GPT
-    const tradingSignal = await getTradingSignalFromGPT(
-      symbol, 
-      quantResult, 
-      sentiment.text,
-      sentiment.score
-    );
-    
-    // 7. Format comprehensive response
-    const signalEmoji = tradingSignal.signal === 'BUY' ? '🟢' : tradingSignal.signal === 'SELL' ? '🔴' : '🟡';
-    
-    const response = `## ${symbol} AI Analysis\n\n` +
-      `### ${signalEmoji} Trading Signal: ${tradingSignal.signal}\n` +
-      `${tradingSignal.reasoning}\n\n` +
-      `---\n\n` +
-      `### 📊 Quantitative Analysis\n` +
-      `• **Composite Score:** ${quantResult.scores.compositeScore}/100\n` +
-      `• **Market Regime:** ${quantResult.marketRegime.toUpperCase()}\n` +
-      `• **Confidence:** ${quantResult.confidence}%\n` +
-      `• **Trend:** ${quantResult.scores.trend}/100\n` +
-      `• **Momentum:** ${quantResult.scores.momentum}/100\n` +
-      `• **Volatility:** ${quantResult.scores.volatility}/100\n` +
-      `• **Volume:** ${quantResult.scores.volume}/100\n` +
-      `• **Risk:** ${quantResult.scores.risk}/100\n\n` +
-      `---\n\n` +
-      `### 💭 Market Sentiment\n` +
-      `**Score:** ${sentiment.score}/100\n` +
-      `${sentiment.text}\n\n` +
-      `---\n\n` +
-      `*Current Price: $${price.toFixed(2)} | Change: ${priceChange >= 0 ? '+' : ''}${priceChange.toFixed(2)}%*`;
     
     return response;
+  } catch (error) {
+    console.error('Error generating market-wide response:', error);
+    return 'Unable to generate market-wide analysis at this time. Please try asking about a specific coin.';
+  }
+}
+
+/**
+ * Main chat handler with full AI integration
+ * Pipeline: Intent Detection → Symbol Extraction OR Market Mode → Fetch OHLC → Run Quant Engine → Fetch Sentiment → Compute Weighted Signal → GPT Formatting → Return
+ */
+export async function processAIChat(message: string): Promise<string> {
+  // 1. Detect intent
+  const intent = await detectIntent(message);
+  
+  // 2. Handle market-wide queries
+  if (intent.isMarketWide || intent.intent === 'market') {
+    return await generateMarketWideResponse(message);
+  }
+  
+  // 3. Handle coin-specific queries
+  if (!intent.symbol) {
+    // No symbol found, but not market-wide - try to provide helpful response
+    return await generateMarketWideResponse(message);
+  }
+  
+  const symbol = intent.symbol;
+  
+  try {
+    // 4. Fetch OHLC data (always fresh, no cache for analysis)
+    const klines = await fetchOHLCData(symbol, '1d', 200);
+    
+    if (klines.length === 0) {
+      return `Unable to fetch market data for ${symbol}. Please try another coin.`;
+    }
+    
+    const ohlc = klinesToOHLC(klines);
+    const { closes, volumes } = extractPriceVolume(klines);
+    
+    // 5. Run quant engine (always fresh)
+    const quantResult = await runQuantEngine({
+      symbol,
+      prices: closes,
+      ohlc,
+      volumes,
+      interval: '1d',
+      sentimentScore: 50 // Will be updated with actual sentiment
+    });
+    
+    // 6. Get current price and prepare market snapshot
+    const currentPrice = await fetchCurrentPrice(symbol) || closes[closes.length - 1];
+    const priceChange = quantResult.metrics.momentum.roc || 0;
+    
+    const marketSnapshot = `Symbol: ${symbol}
+Current Price: $${currentPrice.toFixed(2)}
+Price Change: ${priceChange.toFixed(2)}%
+Composite Score: ${quantResult.scores.compositeScore}/100
+Signal: ${quantResult.signal}
+Market Regime: ${quantResult.marketRegime}
+Trend: ${quantResult.scores.trend}/100
+Momentum: ${quantResult.scores.momentum}/100
+Risk: ${quantResult.scores.risk}/100
+Volatility: ${quantResult.metrics.volatility.regime}
+RSI: ${quantResult.metrics.momentum.rsi.toFixed(1)}`;
+    
+    // 7. Get sentiment analysis
+    const sentiment = await getSentimentAnalysis(symbol, marketSnapshot);
+    
+    // 8. Re-run quant engine with actual sentiment
+    const quantResultWithSentiment = await runQuantEngine({
+      symbol,
+      prices: closes,
+      ohlc,
+      volumes,
+      interval: '1d',
+      sentimentScore: sentiment.score
+    });
+    
+    // 9. Get GPT interpretation score
+    const gptInterpretation = await getGPTInterpretationScore(
+      symbol,
+      quantResultWithSentiment,
+      sentiment.text,
+      sentiment.score,
+      message,
+      intent.scenario
+    );
+    
+    // 10. Compute weighted final signal
+    const finalSignal = computeWeightedSignal(
+      quantResultWithSentiment.signal,
+      sentiment.score,
+      gptInterpretation.score
+    );
+    
+    // 11. Derive whale flow and liquidity scores
+    const whaleFlow = deriveWhaleFlow(quantResultWithSentiment);
+    const liquidityScore = deriveLiquidityScore(quantResultWithSentiment);
+    
+    // 12. Format comprehensive response
+    return formatResponse(
+      symbol,
+      quantResultWithSentiment,
+      sentiment,
+      finalSignal,
+      gptInterpretation.reasoning,
+      whaleFlow,
+      liquidityScore,
+      currentPrice,
+      priceChange
+    );
     
   } catch (error) {
     console.error('Error in AI chat processing:', error);
@@ -361,7 +802,8 @@ export async function getMarketRegimeAnalysis(): Promise<string> {
     }
     
     // Get AI insight on the regime
-    const response = await openai.chat.completions.create({
+    const client = getOpenAIClient();
+    const response = await client.chat.completions.create({
       model: 'gpt-4o',
       messages: [
         {
@@ -370,7 +812,14 @@ export async function getMarketRegimeAnalysis(): Promise<string> {
         },
         {
           role: 'user',
-          content: `Current market regime: ${quantResult.marketRegime}\nVolatility: ${quantResult.metrics.volatility.regime}\nTrend Strength: ${quantResult.scores.trend}/100\nMomentum: ${quantResult.scores.momentum}/100\nRisk: ${quantResult.scores.risk}/100\nConfidence: ${quantResult.confidence}%\n\nProvide trading insights for this market condition.`
+          content: `Current market regime: ${quantResult.marketRegime}
+Volatility: ${quantResult.metrics.volatility.regime}
+Trend Strength: ${quantResult.scores.trend}/100
+Momentum: ${quantResult.scores.momentum}/100
+Risk: ${quantResult.scores.risk}/100
+Confidence: ${quantResult.confidence}%
+
+Provide trading insights for this market condition.`
         }
       ],
       temperature: 0.5,
@@ -379,15 +828,19 @@ export async function getMarketRegimeAnalysis(): Promise<string> {
     
     const aiInsight = response.choices[0]?.message?.content || '';
     
-    return `## Market Regime Analysis\n\n` +
-      `**Regime:** ${quantResult.marketRegime.toUpperCase()}\n` +
-      `**Volatility:** ${quantResult.metrics.volatility.regime}\n` +
-      `**Trend Strength:** ${quantResult.scores.trend}/100\n` +
-      `**Momentum:** ${quantResult.scores.momentum}/100\n` +
-      `**Risk:** ${quantResult.scores.risk}/100\n` +
-      `**Confidence:** ${quantResult.confidence}%\n\n` +
-      `---\n\n` +
-      `### AI Insight\n${aiInsight}`;
+    return `## Market Regime Analysis
+
+**Regime:** ${quantResult.marketRegime.toUpperCase()}
+**Volatility:** ${quantResult.metrics.volatility.regime}
+**Trend Strength:** ${quantResult.scores.trend}/100
+**Momentum:** ${quantResult.scores.momentum}/100
+**Risk:** ${quantResult.scores.risk}/100
+**Confidence:** ${quantResult.confidence}%
+
+---
+
+### AI Insight
+${aiInsight}`;
     
   } catch (error) {
     console.error('Error in regime analysis:', error);

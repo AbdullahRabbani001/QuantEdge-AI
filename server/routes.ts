@@ -713,9 +713,19 @@ export async function registerRoutes(app: Express): Promise<Server> {
       }
 
       res.json({ response });
-    } catch (error) {
+    } catch (error: any) {
       console.error("Error in /api/chat:", error);
-      res.status(500).json({ error: "Failed to process chat message" });
+      const errorMessage = error?.message || "Failed to process chat message";
+      
+      // Check if it's an API key error
+      if (errorMessage.includes('OPENAI_API_KEY')) {
+        return res.status(500).json({ 
+          error: errorMessage,
+          hint: "Please create a .env file in the project root with: OPENAI_API_KEY=your_key_here"
+        });
+      }
+      
+      res.status(500).json({ error: errorMessage });
     }
   });
 
